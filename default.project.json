@@ -1,0 +1,39 @@
+{
+  "name": "rovm",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "$className": "ReplicatedStorage",
+      "$path": "ReplicatedStorage"
+    },
+    "ServerScriptService": {
+      "$className": "ServerScriptService",
+      "Compiler": {
+        "$className": "Folder",
+        "$path": "ServerScriptService/Compiler"
+      },
+      "CompilerService": {
+        "$className": "Script",
+        "$path": "ServerScriptService/CompilerService.lua"
+      },
+      "FilesystemServer": {
+        "$className": "Script",
+        "$path": "ServerScriptService/FilesystemServer.lua"
+      }
+    },
+    "StarterPlayer": {
+      "$className": "StarterPlayer",
+      "StarterPlayerScripts": {
+        "$className": "StarterPlayerScripts",
+        "Modules": {
+          "$className": "Folder",
+          "$path": "StarterPlayer/StarterPlayerScripts/Modules"
+        },
+        "main": {
+          "$className": "LocalScript",
+          "$path": "StarterPlayer/StarterPlayerScripts/main.lua"
+        }
+      }
+    }
+  }
+}

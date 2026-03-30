@@ -1,0 +1,8 @@
+*.rbxl
+*.rbxlx
+*.log
+*.tmp
+Thumbs.db
+.DS_Store
+.vscode/
+sourcemap.json
