@@ -1,6 +1,10 @@
 --!native
 --plain vpage -> ppage map
 
+local bit32 = bit32
+local rshift = bit32.rshift
+local band = bit32.band
+
 local PageTable = {}
 PageTable.__index = PageTable
 
@@ -11,6 +15,8 @@ PageTable.PERM_EXEC = 4
 PageTable.PERM_COW = 8  --copy-on-write flag
 
 local PAGE_SIZE = 4096 --4*1024 bytes, same number everywhere or hell breaks loose
+local PAGE_SHIFT = 12  --log2(4096)
+local PAGE_MASK = 0xFFF --4096-1
 
 function PageTable.new(pid, physicalAllocator)
 	local self = setmetatable({}, PageTable)
@@ -154,11 +160,11 @@ function PageTable:fork(newPid)
 end
 
 function PageTable:addressToPage(addr)
-	return math.floor(addr / PAGE_SIZE)
+	return rshift(addr, PAGE_SHIFT)
 end
 
 function PageTable:getPageOffset(addr)
-	return addr % PAGE_SIZE
+	return band(addr, PAGE_MASK)
 end
 
 function PageTable:getAllMappedPages()

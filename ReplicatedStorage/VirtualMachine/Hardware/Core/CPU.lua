@@ -707,7 +707,7 @@ local function findDecodedInstruction(segments, pc)
 	return nil, nil
 end
 
---hot loop: try predecoded text first, fall back to raw fetch, write trap/pc back once at the end
+--hot loop: TLB-accelerated, cached decode segments, minimal overhead
 function CPU:runSlice(max)
 	max = max or 1_000_000
 	if not self.running then
@@ -727,6 +727,26 @@ function CPU:runSlice(max)
 	local decodeSegments = self.decodeSegments or {}
 	local steps = 0
 	local trapInfo = self.trap
+
+	--TLB arrays pulled into locals for maximum speed
+	local hasTLB = (mmu ~= nil and mode == CPU.MODE_USER)
+	local tlbVPages = hasTLB and mmu.tlbVPages or nil
+	local tlbPPages = hasTLB and mmu.tlbPPages or nil
+	local tlbPerms  = hasTLB and mmu.tlbPerms or nil
+	local tlbMask   = hasTLB and mmu.tlbMask or 0
+	local PAGE_SHIFT = 12
+	local PAGE_MASK  = 0xFFF
+	--permission bitmask constants matching PageTable.PERM_*
+	local PERM_READ_BIT  = 1  --PageTable.PERM_READ
+	local PERM_WRITE_BIT = 2  --PageTable.PERM_WRITE
+	local PERM_EXEC_BIT  = 4  --PageTable.PERM_EXEC
+	local PERM_COW_BIT   = 8  --PageTable.PERM_COW
+
+	--cached decode segment: avoids per-instruction linear scan
+	local cachedSeg = nil
+	local cachedSegBase = 0
+	local cachedSegLimit = 0
+	local cachedSegEntries = nil
 
 	local function setTrapLocal(kind, info, trapPc, stopRunning)
 		local t = { kind = kind, pc = trapPc or pc }
@@ -771,9 +791,9 @@ function CPU:runSlice(max)
 		end
 	end
 
-	--user accesses translate through the mmu here
-	--if cow trips, patch the page once and keep moving :pray:
-	local function translateUser(addr, accessType)
+	--full translate path (TLB miss, or kernel mode).
+	--accessType is a string ("read", "write", "execute") for the MMU fault system.
+	local function translateUserSlow(addr, accessType)
 		if mmu then
 			local phys, fault, faultInfo = mmu:translate(addr, accessType)
 			if fault then
@@ -783,6 +803,9 @@ function CPU:runSlice(max)
 						raiseFaultLocal("cow_fault_handle_failed", addr, accessType, err or "cow fault handler failed", pc)
 						return nil
 					end
+					--TLB was invalidated in-place by invalidateTLBPage; the local array
+					--references are still valid since tables are mutated, not replaced.
+					--The next translate() below will repopulate the slot with the new mapping.
 					phys, fault, faultInfo = mmu:translate(addr, accessType)
 				end
 				if fault then
@@ -799,12 +822,48 @@ function CPU:runSlice(max)
 		return addr
 	end
 
+	--TLB-accelerated translateUser: tries TLB first, falls back to slow path.
+	--accessPerm is the PageTable permission bit required: PERM_READ_BIT, PERM_WRITE_BIT, or PERM_EXEC_BIT.
+	--Using a numeric bit lets the TLB check the correct permission without string comparisons.
+	local function translateUser(addr, accessPerm)
+		if hasTLB then
+			local vpage = rshift(addr, PAGE_SHIFT)
+			local slot = band(vpage, tlbMask) + 1
+			if tlbVPages[slot] == vpage then
+				local perms = tlbPerms[slot]
+				--write to a COW page must resolve the fault first
+				if accessPerm == PERM_WRITE_BIT and band(perms, PERM_COW_BIT) ~= 0 then
+					return translateUserSlow(addr, "write")
+				end
+				--check the specific permission bit (READ, WRITE, or EXEC)
+				if band(perms, accessPerm) == 0 then
+					local accessStr = accessPerm == PERM_WRITE_BIT and "write"
+						or accessPerm == PERM_EXEC_BIT and "execute"
+						or "read"
+					return translateUserSlow(addr, accessStr)
+				end
+				return tlbPPages[slot] * 4096 + band(addr, PAGE_MASK)
+			end
+			--TLB miss: fall through to full translate
+			local accessStr = accessPerm == PERM_WRITE_BIT and "write"
+				or accessPerm == PERM_EXEC_BIT and "execute"
+				or "read"
+			return translateUserSlow(addr, accessStr)
+		end
+		local accessStr = accessPerm == PERM_WRITE_BIT and "write"
+			or accessPerm == PERM_EXEC_BIT and "execute"
+			or "read"
+		return translateUserSlow(addr, accessStr)
+	end
+
 	local function readWord(addr, accessType)
 		if mode == CPU.MODE_USER and addr >= 0 and addr + 3 < fastUserRamLimit then
-			local phys = translateUser(addr, accessType)
+			--instruction fetch checks EXEC permission; data reads check READ permission
+			local perm = (accessType == "execute" and strictExecute) and PERM_EXEC_BIT or PERM_READ_BIT
+			local phys = translateUser(addr, perm)
 			if phys == nil then return 0, true end
 			if phys < 0 or phys + 3 >= memSize then
-				raiseFaultLocal("ram_oob_read", addr, accessType, nil, pc)
+				raiseFaultLocal("ram_oob_read", addr, accessType or "read", nil, pc)
 				return 0, true
 			end
 			return buffer_readu32(memBuf, phys), false
@@ -821,10 +880,10 @@ function CPU:runSlice(max)
 
 	local function writeWord(addr, value, accessType)
 		if mode == CPU.MODE_USER and addr >= 0 and addr + 3 < fastUserRamLimit then
-			local phys = translateUser(addr, accessType)
+			local phys = translateUser(addr, PERM_WRITE_BIT)
 			if phys == nil then return true end
 			if phys < 0 or phys + 3 >= memSize then
-				raiseFaultLocal("ram_oob_write", addr, accessType, nil, pc)
+				raiseFaultLocal("ram_oob_write", addr, accessType or "write", nil, pc)
 				return true
 			end
 			buffer_writeu32(memBuf, phys, value)
@@ -841,10 +900,10 @@ function CPU:runSlice(max)
 
 	local function readByte(addr, accessType)
 		if mode == CPU.MODE_USER and addr >= 0 and addr < fastUserRamLimit then
-			local phys = translateUser(addr, accessType)
+			local phys = translateUser(addr, PERM_READ_BIT)
 			if phys == nil then return 0, true end
 			if phys < 0 or phys >= memSize then
-				raiseFaultLocal("ram_oob_read", addr, accessType, nil, pc)
+				raiseFaultLocal("ram_oob_read", addr, accessType or "read", nil, pc)
 				return 0, true
 			end
 			return buffer_readu8(memBuf, phys), false
@@ -860,10 +919,10 @@ function CPU:runSlice(max)
 
 	local function writeByte(addr, value, accessType)
 		if mode == CPU.MODE_USER and addr >= 0 and addr < fastUserRamLimit then
-			local phys = translateUser(addr, accessType)
+			local phys = translateUser(addr, PERM_WRITE_BIT)
 			if phys == nil then return true end
 			if phys < 0 or phys >= memSize then
-				raiseFaultLocal("ram_oob_write", addr, accessType, nil, pc)
+				raiseFaultLocal("ram_oob_write", addr, accessType or "write", nil, pc)
 				return true
 			end
 			buffer_writeu8(memBuf, phys, value)
@@ -880,10 +939,10 @@ function CPU:runSlice(max)
 
 	local function readU16(addr, accessType)
 		if mode == CPU.MODE_USER and addr >= 0 and addr + 1 < fastUserRamLimit then
-			local phys = translateUser(addr, accessType)
+			local phys = translateUser(addr, PERM_READ_BIT)
 			if phys == nil then return 0, true end
 			if phys < 0 or phys + 1 >= memSize then
-				raiseFaultLocal("ram_oob_read", addr, accessType, nil, pc)
+				raiseFaultLocal("ram_oob_read", addr, accessType or "read", nil, pc)
 				return 0, true
 			end
 			return buffer_readu16(memBuf, phys), false
@@ -899,10 +958,10 @@ function CPU:runSlice(max)
 
 	local function writeU16(addr, value, accessType)
 		if mode == CPU.MODE_USER and addr >= 0 and addr + 1 < fastUserRamLimit then
-			local phys = translateUser(addr, accessType)
+			local phys = translateUser(addr, PERM_WRITE_BIT)
 			if phys == nil then return true end
 			if phys < 0 or phys + 1 >= memSize then
-				raiseFaultLocal("ram_oob_write", addr, accessType, nil, pc)
+				raiseFaultLocal("ram_oob_write", addr, accessType or "write", nil, pc)
 				return true
 			end
 			buffer_writeu16(memBuf, phys, value)
@@ -926,9 +985,11 @@ function CPU:runSlice(max)
 		local imm
 		local size
 
-		local decoded, seg = findDecodedInstruction(decodeSegments, pc)
-		if seg ~= nil then
-			--decoded path already has size/op/imm, so there is nothing left to unpack
+		--try cached segment first to avoid linear scan on every instruction
+		local decoded
+		if pc >= cachedSegBase and pc < cachedSegLimit then
+			local idx = rshift(pc - cachedSegBase, 2) + 1
+			decoded = cachedSegEntries[idx]
 			if not decoded then
 				raiseFaultLocal("invalid_opcode", pc, "execute", ("invalid instruction boundary @ pc 0x%X"):format(pc), pc)
 				break
@@ -940,20 +1001,49 @@ function CPU:runSlice(max)
 			imm = decoded.imm
 			size = decoded.size or 4
 		else
-			--raw path reads the opcode word and, for wide ops, the second word behind it
-			local instr, bad = readWord(pc, strictExecute and "execute" or "read")
-			if bad then break end
-			opcode = rshift(instr, 24)
-			d = band(rshift(instr, 16), 0xFF)
-			a = band(rshift(instr, 8), 0xFF)
-			b = band(instr, 0xFF)
-			size = WIDE_OPCODE[opcode] and 8 or 4
-			if WIDE_OPCODE[opcode] then
-				local nextImm, immBad = readWord(pc + 4, "read")
-				if immBad then break end
-				imm = nextImm
-			elseif opcode >= 0x32 and opcode <= 0x37 then
-				imm = signExtend16(lshift(a, 8) + b)
+			--segment miss: scan for matching segment and cache it
+			local seg = nil
+			for i = 1, #decodeSegments do
+				local s = decodeSegments[i]
+				if pc >= s.base and pc < s.limit then
+					seg = s
+					break
+				end
+			end
+			if seg ~= nil then
+				cachedSeg = seg
+				cachedSegBase = seg.base
+				cachedSegLimit = seg.limit
+				cachedSegEntries = seg.entries
+				local idx = rshift(pc - cachedSegBase, 2) + 1
+				decoded = cachedSegEntries[idx]
+				if not decoded then
+					raiseFaultLocal("invalid_opcode", pc, "execute", ("invalid instruction boundary @ pc 0x%X"):format(pc), pc)
+					break
+				end
+				opcode = decoded.opcode
+				d = decoded.d or 0
+				a = decoded.a or 0
+				b = decoded.b or 0
+				imm = decoded.imm
+				size = decoded.size or 4
+			else
+				decoded = nil
+				--raw path reads the opcode word and, for wide ops, the second word behind it
+				local instr, bad = readWord(pc, strictExecute and "execute" or "read")
+				if bad then break end
+				opcode = rshift(instr, 24)
+				d = band(rshift(instr, 16), 0xFF)
+				a = band(rshift(instr, 8), 0xFF)
+				b = band(instr, 0xFF)
+				size = WIDE_OPCODE[opcode] and 8 or 4
+				if WIDE_OPCODE[opcode] then
+					local nextImm, immBad = readWord(pc + 4, "read")
+					if immBad then break end
+					imm = nextImm
+				elseif opcode >= 0x32 and opcode <= 0x37 then
+					imm = signExtend16(lshift(a, 8) + b)
+				end
 			end
 		end
 
