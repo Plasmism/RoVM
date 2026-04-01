@@ -14,8 +14,8 @@ function Scheduler.new()
 	self.currentPid = nil  --currently running pid
 	self.nextPid = 1
 	
-	--200000 instructions per slice
-	self.timeSlice = 200000  --instructions per time slice
+	--500000 instructions per slice (larger = less context switch overhead)
+	self.timeSlice = 500000  --instructions per time slice
 	self.currentSlice = 0
 	
 	return self

@@ -1805,33 +1805,25 @@ function cpuThreadOps.runCurrentProcessBatch(currentProc, currentCpu)
 		return
 	end
 
-	local BATCH_SIZE = 50000
+	local BATCH_SIZE = 200000
 	local sliceLeft = scheduler.timeSlice - scheduler.currentSlice
 	local executeLimit = (sliceLeft < BATCH_SIZE) and sliceLeft or BATCH_SIZE
 
 	if executeLimit > 0 then
 		local stepsExecuted = 0
 		local execStart = os.clock()
-		local ok, err = pcall(function()
-			stepsExecuted = currentCpu:runSlice(executeLimit)
-		end)
+		stepsExecuted = currentCpu:runSlice(executeLimit)
 		local execElapsed = os.clock() - execStart
-
-		if not ok then
-			currentCpu.running = false
-			currentCpu.trap = {
-				kind = "panic",
-				msg = tostring(err),
-				pc = currentCpu.pc,
-			}
-		end
 
 		currentProc.cpuTime += stepsExecuted
 		scheduler:consumeSlice(stepsExecuted)
 		vmInstructionCount += stepsExecuted
 		if execElapsed > 0 and stepsExecuted > 0 then
 			vmExecutionTime += execElapsed
-			vmMipsX100 = math.floor((vmInstructionCount / vmExecutionTime) / 10000 + 0.5)
+			--only recalculate MIPS periodically to reduce overhead
+			if vmInstructionCount % 2000000 < stepsExecuted then
+				vmMipsX100 = math.floor((vmInstructionCount / vmExecutionTime) / 10000 + 0.5)
+			end
 		end
 	end
 end
